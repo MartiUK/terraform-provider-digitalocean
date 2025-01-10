@@ -298,6 +298,7 @@ func TestAccDigitalOceanKubernetesCluster_UpdateCluster(t *testing.T) {
 				Check: resource.ComposeAggregateTestCheckFunc(
 					testAccCheckDigitalOceanKubernetesClusterExists("digitalocean_kubernetes_cluster.foobar", &k8s),
 					resource.TestCheckResourceAttr("digitalocean_kubernetes_cluster.foobar", "name", rName),
+					resource.TestCheckResourceAttr("digitalocean_kubernetes_cluster.foobar", "ha", "false"),
 				),
 			},
 			{
@@ -310,6 +311,7 @@ func TestAccDigitalOceanKubernetesCluster_UpdateCluster(t *testing.T) {
 					resource.TestCheckTypeSetElemAttr("digitalocean_kubernetes_cluster.foobar", "tags.*", "two"),
 					resource.TestCheckResourceAttr("digitalocean_kubernetes_cluster.foobar", "node_pool.0.labels.%", "0"),
 					resource.TestCheckResourceAttr("digitalocean_kubernetes_cluster.foobar", "surge_upgrade", "true"),
+					resource.TestCheckResourceAttr("digitalocean_kubernetes_cluster.foobar", "ha", "true"),
 				),
 			},
 		},
@@ -757,6 +759,29 @@ func TestAccDigitalOceanKubernetesCluster_DestroyAssociated(t *testing.T) {
 	})
 }
 
+func TestAccDigitalOceanKubernetesCluster_VPCNative(t *testing.T) {
+	rName := acceptance.RandomTestName()
+	var k8s godo.KubernetesCluster
+
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:          func() { acceptance.TestAccPreCheck(t) },
+		ProviderFactories: acceptance.TestAccProviderFactories,
+		CheckDestroy:      testAccCheckDigitalOceanKubernetesClusterDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccDigitalOceanKubernetesConfigVPCNative(testClusterVersionLatest, rName),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					testAccCheckDigitalOceanKubernetesClusterExists("digitalocean_kubernetes_cluster.foobar", &k8s),
+					resource.TestCheckResourceAttr("digitalocean_kubernetes_cluster.foobar", "name", rName),
+					resource.TestCheckResourceAttr("digitalocean_kubernetes_cluster.foobar", "region", "nyc1"),
+					resource.TestCheckResourceAttr("digitalocean_kubernetes_cluster.foobar", "cluster_subnet", "192.168.0.0/20"),
+					resource.TestCheckResourceAttr("digitalocean_kubernetes_cluster.foobar", "service_subnet", "192.168.16.0/22"),
+				),
+			},
+		},
+	})
+}
+
 func testAccDigitalOceanKubernetesConfigBasic(testClusterVersion string, rName string) string {
 	return fmt.Sprintf(`%s
 
@@ -865,27 +890,9 @@ resource "digitalocean_kubernetes_cluster" "foobar" {
   name          = "%s"
   region        = "lon1"
   surge_upgrade = true
+  ha            = true
   version       = data.digitalocean_kubernetes_versions.test.latest_version
   tags          = ["one", "two"]
-
-  node_pool {
-    name       = "default"
-    size       = "s-2vcpu-4gb"
-    node_count = 1
-    tags       = ["foo", "bar"]
-  }
-}
-`, testClusterVersion, rName)
-}
-
-func testAccDigitalOceanKubernetesConfigBasic5(testClusterVersion string, rName string) string {
-	return fmt.Sprintf(`%s
-
-resource "digitalocean_kubernetes_cluster" "foobar" {
-  name    = "%s"
-  region  = "lon1"
-  version = data.digitalocean_kubernetes_versions.test.latest_version
-  tags    = ["one", "two"]
 
   node_pool {
     name       = "default"
@@ -937,6 +944,24 @@ resource "digitalocean_kubernetes_cluster" "foobar" {
   version                          = data.digitalocean_kubernetes_versions.test.latest_version
   destroy_all_associated_resources = true
 
+  node_pool {
+    name       = "default"
+    size       = "s-1vcpu-2gb"
+    node_count = 1
+  }
+}
+`, testClusterVersion, rName)
+}
+
+func testAccDigitalOceanKubernetesConfigVPCNative(testClusterVersion string, rName string) string {
+	return fmt.Sprintf(`%s
+
+resource "digitalocean_kubernetes_cluster" "foobar" {
+  name           = "%s"
+  region         = "nyc1"
+  version        = data.digitalocean_kubernetes_versions.test.latest_version
+  cluster_subnet = "192.168.0.0/20"
+  service_subnet = "192.168.16.0/22"
   node_pool {
     name       = "default"
     size       = "s-1vcpu-2gb"
@@ -1053,12 +1078,12 @@ users:
 		Token:                    "97ae2bbcfd85c34155a56b822ffa73909d6770b28eb7e5dfa78fa83e02ffc60f",
 		ExpiresAt:                time.Now(),
 	}
-	kubeConfigRenderd, err := kubernetes.RenderKubeconfig("test-cluster", "lon1", &creds)
+	kubeConfigRendered, err := kubernetes.RenderKubeconfig("test-cluster", "lon1", &creds)
 	if err != nil {
 		t.Errorf("error calling renderKubeconfig: %s", err)
 
 	}
-	got := string(kubeConfigRenderd)
+	got := string(kubeConfigRendered)
 
 	if !reflect.DeepEqual(got, expected) {
 		t.Errorf("renderKubeconfig returned %+v\n, expected %+v\n", got, expected)

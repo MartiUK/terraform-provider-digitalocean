@@ -1,5 +1,6 @@
 ---
 page_title: "DigitalOcean: digitalocean_app"
+subcategory: "App Platform"
 ---
 
 # digitalocean_app
@@ -29,12 +30,18 @@ output "default_ingress" {
 The following attributes are exported:
 
 * `default_ingress` - The default URL to access the app.
+* `dedicated_ips` - A list of dedicated egress IP addresses associated with the app.
+  - `ip` - The IP address of the dedicated egress IP.
+  - `id` - The ID of the dedicated egress IP.
+  - `status` - The status of the dedicated egress IP.
 * `live_url` - The live URL of the app.
+* `live_domain` - The live domain of the app.
 * `active_deployment_id` - The ID the app's currently active deployment.
 * `urn` - The uniform resource identifier for the app.
 * `updated_at` - The date and time of when the app was last updated.
 * `created_at` - The date and time of when the app was created.
 * `spec` - A DigitalOcean App spec describing the app.
+* `project_id` - The ID of the project that the app is assigned to.
 
 A spec can contain multiple components.
 
@@ -66,6 +73,7 @@ A `service` can contain:
   - `registry` - The registry name. Must be left empty for the `DOCR` registry type. Required for the `DOCKER_HUB` registry type.
   - `repository` - The repository name.
   - `tag` - The repository tag. Defaults to `latest` if not provided.
+  - `digest` - The image digest. Cannot be specified if `tag` is provided.
   - `deploy_on_push` - Configures automatically deploying images pushed to DOCR.
       - `enabled` - Whether to automatically deploy images pushed to DOCR.
 * `env` - Describes an environment variable made available to an app competent.
@@ -83,6 +91,31 @@ A `service` can contain:
   - `timeout_seconds` - The number of seconds after which the check times out.
   - `success_threshold` - The number of successful health checks before considered healthy.
   - `failure_threshold` - The number of failed health checks before considered unhealthy.
+* `autoscaling` - Configuration for automatically scaling this component based on metrics.
+  - `min_instance_count` - The minimum amount of instances for this component. Must be less than max_instance_count.
+  - `max_instance_count` - The maximum amount of instances for this component. Must be more than min_instance_count.
+  - `metrics` - The metrics that the component is scaled on.
+    - `cpu` - Settings for scaling the component based on CPU utilization.
+      - `percent` - The average target CPU utilization for the component.
+* `log_destination` - Describes a log forwarding destination.
+  - `name` - Name of the log destination. Minimum length: 2. Maximum length: 42.
+  - `papertrail` - Papertrail configuration.
+      - `endpoint` - Papertrail syslog endpoint.
+  - `datadog` - Datadog configuration.
+      - `endpoint` - Datadog HTTP log intake endpoint.
+      - `api_key` - Datadog API key.
+  - `logtail` - Logtail configuration.
+      - `token` - Logtail token.
+  - `opensearch` - OpenSearch configuration
+      - `endpoint` - OpenSearch API Endpoint. Only HTTPS is supported. Format: https://<host>:<port>. 
+      - `basic_auth` - OpenSearch basic auth
+          - `user` - Username to authenticate with. Only required when endpoint is set. Defaults to doadmin when cluster_name is set.
+          - `password` - Password for user defined in User. Is required when endpoint is set. Cannot be set if using a DigitalOcean DBaaS OpenSearch cluster.
+      - `index_name` - The index name to use for the logs. If not set, the default index name is `logs`.
+      - `cluster_name` - The name of a DigitalOcean DBaaS OpenSearch cluster to use as a log forwarding destination. Cannot be specified if endpoint is also specified.
+* `termination` - Contains a component's termination parameters.
+  - `grace_period_seconds` - The number of seconds to wait between sending a TERM signal to a container and issuing a KILL which causes immediate shutdown. Default: 120, Minimum 1, Maximum 600.
+  - `drain_seconds` - The number of seconds to wait between selecting a container instance for termination and issuing the TERM signal. Selecting a container instance for termination begins an asynchronous drain of new requests on upstream load-balancers. Default: 15 seconds, Minimum 1, Maximum 110.
 
 A `static_site` can contain:
 
@@ -141,6 +174,7 @@ A `worker` can contain:
   - `registry` - The registry name. Must be left empty for the `DOCR` registry type. Required for the `DOCKER_HUB` registry type.
   - `repository` - The repository name.
   - `tag` - The repository tag. Defaults to `latest` if not provided.
+  - `digest` - The image digest. Cannot be specified if `tag` is provided.
   - `deploy_on_push` - Configures automatically deploying images pushed to DOCR.
       - `enabled` - Whether to automatically deploy images pushed to DOCR.
 * `env` - Describes an environment variable made available to an app competent.
@@ -148,6 +182,30 @@ A `worker` can contain:
   - `value` - The value of the environment variable.
   - `scope` - The visibility scope of the environment variable. One of `RUN_TIME`, `BUILD_TIME`, or `RUN_AND_BUILD_TIME` (default).
   - `type` - The type of the environment variable, `GENERAL` or `SECRET`.
+* `log_destination` - Describes a log forwarding destination.
+  - `name` - Name of the log destination. Minimum length: 2. Maximum length: 42.
+  - `papertrail` - Papertrail configuration.
+      - `endpoint` - Papertrail syslog endpoint.
+  - `datadog` - Datadog configuration.
+      - `endpoint` - Datadog HTTP log intake endpoint.
+      - `api_key` - Datadog API key.
+  - `logtail` - Logtail configuration.
+      - `token` - Logtail token.
+  - `opensearch` - OpenSearch configuration
+      - `endpoint` - OpenSearch API Endpoint. Only HTTPS is supported. Format: https://<host>:<port>. 
+      - `basic_auth` - OpenSearch basic auth
+          - `user` - Username to authenticate with. Only required when endpoint is set. Defaults to doadmin when cluster_name is set.
+          - `password` - Password for user defined in User. Is required when endpoint is set. Cannot be set if using a DigitalOcean DBaaS OpenSearch cluster.
+      - `index_name` - The index name to use for the logs. If not set, the default index name is `logs`.
+      - `cluster_name` - The name of a DigitalOcean DBaaS OpenSearch cluster to use as a log forwarding destination. Cannot be specified if endpoint is also specified.
+* `autoscaling` - Configuration for automatically scaling this component based on metrics.
+  - `min_instance_count` - The minimum amount of instances for this component. Must be less than max_instance_count.
+  - `max_instance_count` - The maximum amount of instances for this component. Must be more than min_instance_count.
+  - `metrics` - The metrics that the component is scaled on.
+    - `cpu` - Settings for scaling the component based on CPU utilization.
+      - `percent` - The average target CPU utilization for the component.
+* `termination` - Contains a component's termination parameters.
+  - `grace_period_seconds` - The number of seconds to wait between sending a TERM signal to a container and issuing a KILL which causes immediate shutdown. Default: 120, Minimum 1, Maximum 600.
 
 A `job` can contain:
 
@@ -180,6 +238,7 @@ A `job` can contain:
   - `registry` - The registry name. Must be left empty for the `DOCR` registry type. Required for the `DOCKER_HUB` registry type.
   - `repository` - The repository name.
   - `tag` - The repository tag. Defaults to `latest` if not provided.
+  - `digest` - The image digest. Cannot be specified if `tag` is provided.
   - `deploy_on_push` - Configures automatically deploying images pushed to DOCR.
       - `enabled` - Whether to automatically deploy images pushed to DOCR.
 * `env` - Describes an environment variable made available to an app competent.
@@ -187,6 +246,24 @@ A `job` can contain:
   - `value` - The value of the environment variable.
   - `scope` - The visibility scope of the environment variable. One of `RUN_TIME`, `BUILD_TIME`, or `RUN_AND_BUILD_TIME` (default).
   - `type` - The type of the environment variable, `GENERAL` or `SECRET`.
+* `log_destination` - Describes a log forwarding destination.
+  - `name` - Name of the log destination. Minimum length: 2. Maximum length: 42.
+  - `papertrail` - Papertrail configuration.
+      - `endpoint` - Papertrail syslog endpoint.
+  - `datadog` - Datadog configuration.
+      - `endpoint` - Datadog HTTP log intake endpoint.
+      - `api_key` - Datadog API key.
+  - `logtail` - Logtail configuration.
+      - `token` - Logtail token.
+  - `opensearch` - OpenSearch configuration
+      - `endpoint` - OpenSearch API Endpoint. Only HTTPS is supported. Format: https://<host>:<port>. 
+      - `basic_auth` - OpenSearch basic auth
+          - `user` - Username to authenticate with. Only required when endpoint is set. Defaults to doadmin when cluster_name is set.
+          - `password` - Password for user defined in User. Is required when endpoint is set. Cannot be set if using a DigitalOcean DBaaS OpenSearch cluster.
+      - `index_name` - The index name to use for the logs. If not set, the default index name is `logs`.
+      - `cluster_name` - The name of a DigitalOcean DBaaS OpenSearch cluster to use as a log forwarding destination. Cannot be specified if endpoint is also specified.
+* `termination` - Contains a component's termination parameters.
+  - `grace_period_seconds` - The number of seconds to wait between sending a TERM signal to a container and issuing a KILL which causes immediate shutdown. Default: 120, Minimum 1, Maximum 600.
 
 A `function` component can contain:
 
@@ -230,12 +307,19 @@ A `function` component can contain:
 * `log_destination` - Describes a log forwarding destination.
   - `name` - Name of the log destination. Minimum length: 2. Maximum length: 42.
   - `papertrail` - Papertrail configuration.
-    - `endpoint` - Papertrail syslog endpoint.
+      - `endpoint` - Papertrail syslog endpoint.
   - `datadog` - Datadog configuration.
-    - `endpoint` - Datadog HTTP log intake endpoint.
-    - `api_key` - Datadog API key.
+      - `endpoint` - Datadog HTTP log intake endpoint.
+      - `api_key` - Datadog API key.
   - `logtail` - Logtail configuration.
-    - `token` - Logtail token.
+      - `token` - Logtail token.
+  - `opensearch` - OpenSearch configuration
+      - `endpoint` - OpenSearch API Endpoint. Only HTTPS is supported. Format: https://<host>:<port>. 
+      - `basic_auth` - OpenSearch basic auth
+          - `user` - Username to authenticate with. Only required when endpoint is set. Defaults to doadmin when cluster_name is set.
+          - `password` - Password for user defined in User. Is required when endpoint is set. Cannot be set if using a DigitalOcean DBaaS OpenSearch cluster.
+      - `index_name` - The index name to use for the logs. If not set, the default index name is `logs`.
+      - `cluster_name` - The name of a DigitalOcean DBaaS OpenSearch cluster to use as a log forwarding destination. Cannot be specified if endpoint is also specified.
 
 A `database` can contain:
 
