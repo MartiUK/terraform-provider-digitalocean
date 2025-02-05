@@ -2,6 +2,7 @@ package app
 
 import (
 	"log"
+	"net/http"
 
 	"github.com/digitalocean/godo"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
@@ -17,6 +18,11 @@ const (
 	jobComponent        appSpecComponentType = "job"
 	functionComponent   appSpecComponentType = "function"
 )
+
+// AppSpecTermination is a type constraint for the termination attribute of an app component.
+type AppSpecTermination interface {
+	godo.AppServiceSpecTermination | godo.AppWorkerSpecTermination | godo.AppJobSpecTermination
+}
 
 // appSpecSchema returns map[string]*schema.Schema for the App Specification.
 // Set isResource to true in order to return a schema with additional attributes
@@ -40,6 +46,13 @@ func appSpecSchema(isResource bool) map[string]*schema.Schema {
 			Computed: true,
 			Elem:     appSpecDomainSchema(),
 		},
+		"features": {
+			Type:        schema.TypeSet,
+			Optional:    true,
+			Computed:    true,
+			Elem:        &schema.Schema{Type: schema.TypeString},
+			Description: "List of features which is applied to the app",
+		},
 		"domains": {
 			Type:       schema.TypeSet,
 			Optional:   true,
@@ -50,7 +63,6 @@ func appSpecSchema(isResource bool) map[string]*schema.Schema {
 		"service": {
 			Type:     schema.TypeList,
 			Optional: true,
-			MinItems: 1,
 			Elem:     appSpecServicesSchema(),
 		},
 		"static_site": {
@@ -89,6 +101,30 @@ func appSpecSchema(isResource bool) map[string]*schema.Schema {
 			Optional: true,
 			Elem:     appSpecAppLevelAlerts(),
 			Set:      schema.HashResource(appSpecAppLevelAlerts()),
+		},
+		"ingress": {
+			Type:     schema.TypeList,
+			Optional: true,
+			Computed: true,
+			MaxItems: 1,
+			Elem:     appSpecIngressSchema(),
+		},
+		"egress": {
+			Type:     schema.TypeList,
+			Optional: true,
+			Elem: &schema.Resource{
+				Schema: map[string]*schema.Schema{
+					"type": {
+						Type:        schema.TypeString,
+						Optional:    true,
+						Description: "The app egress type.",
+						ValidateFunc: validation.StringInSlice([]string{
+							"AUTOASSIGN",
+							"DEDICATED_IP",
+						}, false),
+					},
+				},
+			},
 		},
 	}
 
@@ -142,6 +178,8 @@ func appSpecAppLevelAlerts() *schema.Resource {
 				ValidateFunc: validation.StringInSlice([]string{
 					string(godo.AppAlertSpecRule_DeploymentFailed),
 					string(godo.AppAlertSpecRule_DeploymentLive),
+					string(godo.AppAlertSpecRule_DeploymentStarted),
+					string(godo.AppAlertSpecRule_DeploymentCanceled),
 					string(godo.AppAlertSpecRule_DomainFailed),
 					string(godo.AppAlertSpecRule_DomainLive),
 				}, false),
@@ -198,6 +236,10 @@ func appSpecGitLabSourceSchema() map[string]*schema.Schema {
 	return appSpecGitServiceSourceSchema()
 }
 
+func appSpecBitBucketSourceSchema() map[string]*schema.Schema {
+	return appSpecGitServiceSourceSchema()
+}
+
 func appSpecImageSourceSchema() map[string]*schema.Schema {
 	return map[string]*schema.Schema{
 		"registry_type": {
@@ -207,6 +249,7 @@ func appSpecImageSourceSchema() map[string]*schema.Schema {
 				"UNSPECIFIED",
 				"DOCKER_HUB",
 				"DOCR",
+				"GHCR",
 			}, false),
 			Description: "The registry type.",
 		},
@@ -223,7 +266,12 @@ func appSpecImageSourceSchema() map[string]*schema.Schema {
 		"tag": {
 			Type:        schema.TypeString,
 			Optional:    true,
-			Description: "The repository tag. Defaults to latest if not provided.",
+			Description: "The repository tag. Defaults to latest if not provided. Cannot be specified if digest is provided.",
+		},
+		"digest": {
+			Type:        schema.TypeString,
+			Optional:    true,
+			Description: "The image digest. Cannot be specified if tag is provided.",
 		},
 		"deploy_on_push": {
 			Type:        schema.TypeList,
@@ -239,6 +287,12 @@ func appSpecImageSourceSchema() map[string]*schema.Schema {
 					},
 				},
 			},
+		},
+		"registry_credentials": {
+			Type:        schema.TypeString,
+			Optional:    true,
+			Description: "Access credentials for third-party registries",
+			Sensitive:   true,
 		},
 	}
 }
@@ -306,6 +360,12 @@ func appSpecRouteSchema() map[string]*schema.Schema {
 
 func appSpecHealthCheckSchema() map[string]*schema.Schema {
 	return map[string]*schema.Schema{
+		"port": {
+			Type:         schema.TypeInt,
+			Optional:     true,
+			Description:  "The port on which the health check will be performed. If not set, the health check will be performed on the component's http_port.",
+			ValidateFunc: validation.IntBetween(1, 65535),
+		},
 		"http_path": {
 			Type:        schema.TypeString,
 			Optional:    true,
@@ -356,7 +416,8 @@ func appSpecCORSSchema() map[string]*schema.Schema {
 					"prefix": {
 						Type:        schema.TypeString,
 						Optional:    true,
-						Description: "Prefix-based match. ",
+						Description: "Prefix-based match.",
+						Deprecated:  "Prefix-based matching has been deprecated in favor of regex-based matching.",
 					},
 					"regex": {
 						Type:        schema.TypeString,
@@ -397,6 +458,72 @@ func appSpecCORSSchema() map[string]*schema.Schema {
 	}
 }
 
+func appSpecAutoscalingSchema() map[string]*schema.Schema {
+	return map[string]*schema.Schema{
+		"min_instance_count": {
+			Type:         schema.TypeInt,
+			Required:     true,
+			ValidateFunc: validation.IntAtLeast(1),
+			Description:  "The minimum amount of instances for this component. Must be less than max_instance_count.",
+		},
+		"max_instance_count": {
+			Type:         schema.TypeInt,
+			Required:     true,
+			ValidateFunc: validation.IntAtLeast(1),
+			Description:  "The maximum amount of instances for this component. Must be more than min_instance_count.",
+		},
+		"metrics": {
+			Type:        schema.TypeList,
+			MaxItems:    1,
+			MinItems:    1,
+			Required:    true,
+			Description: "The metrics that the component is scaled on.",
+			Elem: &schema.Resource{
+				Schema: map[string]*schema.Schema{
+					"cpu": {
+						Type:        schema.TypeList,
+						MaxItems:    1,
+						Optional:    true,
+						Description: "Settings for scaling the component based on CPU utilization.",
+						Elem: &schema.Resource{
+							Schema: map[string]*schema.Schema{
+								"percent": {
+									Type:         schema.TypeInt,
+									ValidateFunc: validation.IntBetween(1, 100),
+									Required:     true,
+									Description:  "The average target CPU utilization for the component.",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func appSpecTerminationSchema(component appSpecComponentType) map[string]*schema.Schema {
+	termination := map[string]*schema.Schema{
+		"grace_period_seconds": {
+			Type:         schema.TypeInt,
+			Optional:     true,
+			ValidateFunc: validation.IntBetween(1, 600),
+			Description:  "The number of seconds to wait between sending a TERM signal to a container and issuing a KILL which causes immediate shutdown. Default: 120, Minimum 1, Maximum 600.",
+		},
+	}
+
+	if component == serviceComponent {
+		termination["drain_seconds"] = &schema.Schema{
+			Type:         schema.TypeInt,
+			Optional:     true,
+			ValidateFunc: validation.IntBetween(1, 110),
+			Description:  "The number of seconds to wait between selecting a container instance for termination and issuing the TERM signal. Selecting a container instance for termination begins an asynchronous drain of new requests on upstream load-balancers. Default: 15 seconds, Minimum 1, Maximum 110.",
+		}
+	}
+
+	return termination
+}
+
 func appSpecComponentBase(componentType appSpecComponentType) map[string]*schema.Schema {
 	baseSchema := map[string]*schema.Schema{
 		"name": {
@@ -426,6 +553,14 @@ func appSpecComponentBase(componentType appSpecComponentType) map[string]*schema
 			MaxItems: 1,
 			Elem: &schema.Resource{
 				Schema: appSpecGitLabSourceSchema(),
+			},
+		},
+		"bitbucket": {
+			Type:     schema.TypeList,
+			Optional: true,
+			MaxItems: 1,
+			Elem: &schema.Resource{
+				Schema: appSpecBitBucketSourceSchema(),
 			},
 		},
 		"env": {
@@ -501,7 +636,6 @@ func appSpecServicesSchema() *schema.Resource {
 		"instance_count": {
 			Type:        schema.TypeInt,
 			Optional:    true,
-			Default:     1,
 			Description: "The amount of instances that this component should be scaled to.",
 		},
 		"health_check": {
@@ -521,9 +655,10 @@ func appSpecServicesSchema() *schema.Resource {
 			},
 		},
 		"routes": {
-			Type:     schema.TypeList,
-			Optional: true,
-			Computed: true,
+			Type:       schema.TypeList,
+			Optional:   true,
+			Computed:   true,
+			Deprecated: "Service level routes are deprecated in favor of ingresses",
 			Elem: &schema.Resource{
 				Schema: appSpecRouteSchema(),
 			},
@@ -531,14 +666,32 @@ func appSpecServicesSchema() *schema.Resource {
 		"internal_ports": {
 			Type:     schema.TypeSet,
 			Optional: true,
+			Computed: true,
 			Elem:     &schema.Schema{Type: schema.TypeInt},
 		},
 		"cors": {
+			Type:       schema.TypeList,
+			Optional:   true,
+			MaxItems:   1,
+			Deprecated: "Service level CORS rules are deprecated in favor of ingresses",
+			Elem: &schema.Resource{
+				Schema: appSpecCORSSchema(),
+			},
+		},
+		"autoscaling": {
 			Type:     schema.TypeList,
 			Optional: true,
 			MaxItems: 1,
 			Elem: &schema.Resource{
-				Schema: appSpecCORSSchema(),
+				Schema: appSpecAutoscalingSchema(),
+			},
+		},
+		"termination": {
+			Type:     schema.TypeList,
+			Optional: true,
+			MaxItems: 1,
+			Elem: &schema.Resource{
+				Schema: appSpecTerminationSchema(serviceComponent),
 			},
 		},
 	}
@@ -575,17 +728,19 @@ func appSpecStaticSiteSchema() *schema.Resource {
 			Description: "The name of the document to use as the fallback for any requests to documents that are not found when serving this static site.",
 		},
 		"routes": {
-			Type:     schema.TypeList,
-			Optional: true,
-			Computed: true,
+			Type:       schema.TypeList,
+			Optional:   true,
+			Computed:   true,
+			Deprecated: "Service level routes are deprecated in favor of ingresses",
 			Elem: &schema.Resource{
 				Schema: appSpecRouteSchema(),
 			},
 		},
 		"cors": {
-			Type:     schema.TypeList,
-			Optional: true,
-			MaxItems: 1,
+			Type:       schema.TypeList,
+			Optional:   true,
+			MaxItems:   1,
+			Deprecated: "Service level CORS rules are deprecated in favor of ingresses",
 			Elem: &schema.Resource{
 				Schema: appSpecCORSSchema(),
 			},
@@ -624,8 +779,23 @@ func appSpecWorkerSchema() *schema.Resource {
 		"instance_count": {
 			Type:        schema.TypeInt,
 			Optional:    true,
-			Default:     1,
 			Description: "The amount of instances that this component should be scaled to.",
+		},
+		"autoscaling": {
+			Type:     schema.TypeList,
+			Optional: true,
+			MaxItems: 1,
+			Elem: &schema.Resource{
+				Schema: appSpecAutoscalingSchema(),
+			},
+		},
+		"termination": {
+			Type:     schema.TypeList,
+			Optional: true,
+			MaxItems: 1,
+			Elem: &schema.Resource{
+				Schema: appSpecTerminationSchema(workerComponent),
+			},
 		},
 	}
 
@@ -661,7 +831,6 @@ func appSpecJobSchema() *schema.Resource {
 		"instance_count": {
 			Type:        schema.TypeInt,
 			Optional:    true,
-			Default:     1,
 			Description: "The amount of instances that this component should be scaled to.",
 		},
 		"kind": {
@@ -675,6 +844,14 @@ func appSpecJobSchema() *schema.Resource {
 				"FAILED_DEPLOY",
 			}, false),
 			Description: "The type of job and when it will be run during the deployment process.",
+		},
+		"termination": {
+			Type:     schema.TypeList,
+			Optional: true,
+			MaxItems: 1,
+			Elem: &schema.Resource{
+				Schema: appSpecTerminationSchema(jobComponent),
+			},
 		},
 	}
 
@@ -690,17 +867,19 @@ func appSpecJobSchema() *schema.Resource {
 func appSpecFunctionsSchema() *schema.Resource {
 	functionsSchema := map[string]*schema.Schema{
 		"routes": {
-			Type:     schema.TypeList,
-			Optional: true,
-			Computed: true,
+			Type:       schema.TypeList,
+			Optional:   true,
+			Computed:   true,
+			Deprecated: "Service level routes are deprecated in favor of ingresses",
 			Elem: &schema.Resource{
 				Schema: appSpecRouteSchema(),
 			},
 		},
 		"cors": {
-			Type:     schema.TypeList,
-			Optional: true,
-			MaxItems: 1,
+			Type:       schema.TypeList,
+			Optional:   true,
+			MaxItems:   1,
+			Deprecated: "Service level CORS rules are deprecated in favor of ingresses",
 			Elem: &schema.Resource{
 				Schema: appSpecCORSSchema(),
 			},
@@ -770,6 +949,52 @@ func appSpecLogDestinations() *schema.Resource {
 				Type:        schema.TypeString,
 				Required:    true,
 				Description: "Name of the log destination",
+			},
+			"open_search": {
+				Type:        schema.TypeList,
+				Optional:    true,
+				MaxItems:    1,
+				Description: "OpenSearch configuration.",
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"endpoint": {
+							Type:        schema.TypeString,
+							Optional:    true,
+							Description: "OpenSearch endpoint.",
+						},
+						"basic_auth": {
+							Type:        schema.TypeList,
+							Required:    true,
+							Description: "Basic authentication details.",
+							MaxItems:    1,
+							Elem: &schema.Resource{
+								Schema: map[string]*schema.Schema{
+									"user": {
+										Type:        schema.TypeString,
+										Optional:    true,
+										Description: "user for basic authentication.",
+									},
+									"password": {
+										Type:        schema.TypeString,
+										Optional:    true,
+										Sensitive:   true,
+										Description: "Password for basic authentication.",
+									},
+								},
+							},
+						},
+						"index_name": {
+							Type:        schema.TypeString,
+							Optional:    true,
+							Description: "OpenSearch index name.",
+						},
+						"cluster_name": {
+							Type:        schema.TypeString,
+							Optional:    true,
+							Description: "OpenSearch cluster name.",
+						},
+					},
+				},
 			},
 			"papertrail": {
 				Type:        schema.TypeList,
@@ -843,6 +1068,8 @@ func appSpecDatabaseSchema() *schema.Resource {
 					"PG",
 					"REDIS",
 					"MONGODB",
+					"KAFKA",
+					"OPENSEARCH",
 				}, false),
 				Description: "The database engine to use.",
 			},
@@ -875,6 +1102,110 @@ func appSpecDatabaseSchema() *schema.Resource {
 	}
 }
 
+func appSpecIngressSchema() *schema.Resource {
+	return &schema.Resource{
+		Schema: map[string]*schema.Schema{
+			"rule": {
+				Type:     schema.TypeList,
+				Optional: true,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"match": {
+							Type:     schema.TypeList,
+							Optional: true,
+							Computed: true,
+							MaxItems: 1,
+							Elem: &schema.Resource{
+								Schema: map[string]*schema.Schema{
+									"path": {
+										Type:     schema.TypeList,
+										Optional: true,
+										Computed: true,
+										MaxItems: 1,
+										Elem: &schema.Resource{
+											Schema: map[string]*schema.Schema{
+												"prefix": {
+													Type:     schema.TypeString,
+													Optional: true,
+													Computed: true,
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+						"cors": {
+							Type:     schema.TypeList,
+							Optional: true,
+							Computed: true,
+							MaxItems: 1,
+							Elem: &schema.Resource{
+								Schema: appSpecCORSSchema(),
+							},
+						},
+						"component": {
+							Type:     schema.TypeList,
+							Optional: true,
+							Computed: true,
+							MaxItems: 1,
+							Elem: &schema.Resource{
+								Schema: map[string]*schema.Schema{
+									"name": {
+										Type:     schema.TypeString,
+										Optional: true,
+										Computed: true,
+									},
+									"preserve_path_prefix": {
+										Type:     schema.TypeBool,
+										Optional: true,
+										Computed: true,
+									},
+									"rewrite": {
+										Type:     schema.TypeString,
+										Optional: true,
+										Computed: true,
+									},
+								},
+							},
+						},
+						"redirect": {
+							Type:     schema.TypeList,
+							Optional: true,
+							MaxItems: 1,
+							Elem: &schema.Resource{
+								Schema: map[string]*schema.Schema{
+									"uri": {
+										Type:     schema.TypeString,
+										Optional: true,
+									},
+									"authority": {
+										Type:     schema.TypeString,
+										Optional: true,
+									},
+									"port": {
+										Type:     schema.TypeInt,
+										Optional: true,
+									},
+									"scheme": {
+										Type:     schema.TypeString,
+										Optional: true,
+									},
+									"redirect_code": {
+										Type:     schema.TypeInt,
+										Optional: true,
+										Default:  http.StatusFound,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
 func expandAppSpec(config []interface{}) *godo.AppSpec {
 	if len(config) == 0 || config[0] == nil {
 		return &godo.AppSpec{}
@@ -884,6 +1215,7 @@ func expandAppSpec(config []interface{}) *godo.AppSpec {
 	appSpec := &godo.AppSpec{
 		Name:        appSpecConfig["name"].(string),
 		Region:      appSpecConfig["region"].(string),
+		Features:    expandAppSpecFeatures(appSpecConfig["features"].(*schema.Set)),
 		Services:    expandAppSpecServices(appSpecConfig["service"].([]interface{})),
 		StaticSites: expandAppSpecStaticSites(appSpecConfig["static_site"].([]interface{})),
 		Workers:     expandAppSpecWorkers(appSpecConfig["worker"].([]interface{})),
@@ -892,6 +1224,8 @@ func expandAppSpec(config []interface{}) *godo.AppSpec {
 		Databases:   expandAppSpecDatabases(appSpecConfig["database"].([]interface{})),
 		Envs:        expandAppEnvs(appSpecConfig["env"].(*schema.Set).List()),
 		Alerts:      expandAppAlerts(appSpecConfig["alert"].(*schema.Set).List()),
+		Ingress:     expandAppIngress(appSpecConfig["ingress"].([]interface{})),
+		Egress:      expandAppEgress(appSpecConfig["egress"].([]interface{})),
 	}
 
 	// Prefer the `domain` block over `domains` if it is set.
@@ -913,6 +1247,7 @@ func flattenAppSpec(d *schema.ResourceData, spec *godo.AppSpec) []map[string]int
 		r := make(map[string]interface{})
 		r["name"] = (*spec).Name
 		r["region"] = (*spec).Region
+		r["features"] = (*spec).Features
 
 		if len((*spec).Domains) > 0 {
 			r["domains"] = flattenAppDomainSpec((*spec).Domains)
@@ -951,6 +1286,14 @@ func flattenAppSpec(d *schema.ResourceData, spec *godo.AppSpec) []map[string]int
 
 		if len((*spec).Alerts) > 0 {
 			r["alert"] = flattenAppAlerts((*spec).Alerts)
+		}
+
+		if (*spec).Ingress != nil {
+			r["ingress"] = flattenAppIngress((*spec).Ingress)
+		}
+
+		if (*spec).Egress != nil {
+			r["egress"] = flattenAppEgress((*spec).Egress)
 		}
 
 		result = append(result, r)
@@ -1020,6 +1363,17 @@ func expandAppLogDestinations(config []interface{}) []*godo.AppLogDestinationSpe
 			Name: (destination["name"].(string)),
 		}
 
+		open_search := destination["open_search"].([]interface{})
+		if len(open_search) > 0 {
+			openSearchConfig := open_search[0].(map[string]interface{})
+			d.OpenSearch = &godo.AppLogDestinationSpecOpenSearch{
+				Endpoint:    (openSearchConfig["endpoint"].(string)),
+				BasicAuth:   expandAppOpensearchBasicAuth(openSearchConfig["basic_auth"].([]interface{})),
+				IndexName:   (openSearchConfig["index_name"].(string)),
+				ClusterName: (openSearchConfig["cluster_name"].(string)),
+			}
+		}
+
 		papertrail := destination["papertrail"].([]interface{})
 		if len(papertrail) > 0 {
 			papertrailConfig := papertrail[0].(map[string]interface{})
@@ -1084,7 +1438,89 @@ func flattenAppLogDestinations(destinations []*godo.AppLogDestinationSpec) []map
 			r["logtail"] = logtail
 		}
 
+		if d.OpenSearch != nil {
+			openSearch := make([]interface{}, 1)
+
+			openSearch[0] = map[string]interface{}{
+				"endpoint":     d.OpenSearch.Endpoint,
+				"cluster_name": d.OpenSearch.ClusterName,
+				"index_name":   d.OpenSearch.IndexName,
+				"basic_auth": []interface{}{
+					map[string]string{
+						"user":     d.OpenSearch.BasicAuth.User,
+						"password": d.OpenSearch.BasicAuth.Password,
+					},
+				},
+			}
+
+			r["open_search"] = openSearch
+		}
+
 		result[i] = r
+	}
+
+	return result
+}
+
+func expandAppOpensearchBasicAuth(config []interface{}) *godo.OpenSearchBasicAuth {
+	basicAuthConfig := config[0].(map[string]interface{})
+
+	basicAuth := &godo.OpenSearchBasicAuth{
+		User:     basicAuthConfig["user"].(string),
+		Password: basicAuthConfig["password"].(string),
+	}
+
+	return basicAuth
+}
+
+func expandAppAutoscaling(config []interface{}) *godo.AppAutoscalingSpec {
+	autoscalingConfig := config[0].(map[string]interface{})
+
+	autoscalingSpec := &godo.AppAutoscalingSpec{
+		MinInstanceCount: int64(autoscalingConfig["min_instance_count"].(int)),
+		MaxInstanceCount: int64(autoscalingConfig["max_instance_count"].(int)),
+		Metrics:          expandAppAutoscalingMetrics(autoscalingConfig["metrics"].([]interface{})),
+	}
+
+	return autoscalingSpec
+}
+
+func expandAppAutoscalingMetrics(config []interface{}) *godo.AppAutoscalingSpecMetrics {
+	metrics := &godo.AppAutoscalingSpecMetrics{}
+
+	for _, rawMetric := range config {
+		metric := rawMetric.(map[string]interface{})
+		cpu := metric["cpu"].([]interface{})
+		if len(cpu) > 0 {
+			cpuMetric := cpu[0].(map[string]interface{})
+			metrics.CPU = &godo.AppAutoscalingSpecMetricCPU{
+				Percent: int64(cpuMetric["percent"].(int)),
+			}
+		}
+	}
+
+	return metrics
+}
+
+func flattenAppAutoscaling(autoscaling *godo.AppAutoscalingSpec) []map[string]interface{} {
+	result := make([]map[string]interface{}, 0)
+
+	if autoscaling != nil {
+		r := make(map[string]interface{})
+		r["min_instance_count"] = autoscaling.MinInstanceCount
+		r["max_instance_count"] = autoscaling.MaxInstanceCount
+		metrics := make(map[string]interface{})
+		if autoscaling.Metrics.CPU != nil {
+			cpuMetric := make([]map[string]interface{}, 1)
+			cpuMetric[0] = make(map[string]interface{})
+			cpuMetric[0]["percent"] = autoscaling.Metrics.CPU.Percent
+			metrics["cpu"] = cpuMetric
+		}
+		metricsList := make([]map[string]interface{}, 1)
+		metricsList[0] = metrics
+		r["metrics"] = metricsList
+
+		result = append(result, r)
 	}
 
 	return result
@@ -1208,6 +1644,34 @@ func flattenAppGitLabSourceSpec(spec *godo.GitLabSourceSpec) []interface{} {
 	return result
 }
 
+func expandAppBitBucketSourceSpec(config []interface{}) *godo.BitbucketSourceSpec {
+	bitBucketSourceConfig := config[0].(map[string]interface{})
+
+	bitBucketSource := &godo.BitbucketSourceSpec{
+		Repo:         bitBucketSourceConfig["repo"].(string),
+		Branch:       bitBucketSourceConfig["branch"].(string),
+		DeployOnPush: bitBucketSourceConfig["deploy_on_push"].(bool),
+	}
+
+	return bitBucketSource
+}
+
+func flattenAppBitBucketSourceSpec(spec *godo.BitbucketSourceSpec) []interface{} {
+	result := make([]interface{}, 0)
+
+	if spec != nil {
+
+		r := make(map[string]interface{})
+		r["repo"] = (*spec).Repo
+		r["branch"] = (*spec).Branch
+		r["deploy_on_push"] = (*spec).DeployOnPush
+
+		result = append(result, r)
+	}
+
+	return result
+}
+
 func expandAppGitSourceSpec(config []interface{}) *godo.GitSourceSpec {
 	gitSourceConfig := config[0].(map[string]interface{})
 
@@ -1238,10 +1702,12 @@ func expandAppImageSourceSpec(config []interface{}) *godo.ImageSourceSpec {
 	imageSourceConfig := config[0].(map[string]interface{})
 
 	imageSource := &godo.ImageSourceSpec{
-		RegistryType: godo.ImageSourceSpecRegistryType(imageSourceConfig["registry_type"].(string)),
-		Registry:     imageSourceConfig["registry"].(string),
-		Repository:   imageSourceConfig["repository"].(string),
-		Tag:          imageSourceConfig["tag"].(string),
+		RegistryType:        godo.ImageSourceSpecRegistryType(imageSourceConfig["registry_type"].(string)),
+		Registry:            imageSourceConfig["registry"].(string),
+		Repository:          imageSourceConfig["repository"].(string),
+		Tag:                 imageSourceConfig["tag"].(string),
+		Digest:              imageSourceConfig["digest"].(string),
+		RegistryCredentials: imageSourceConfig["registry_credentials"].(string),
 	}
 
 	docrPush := imageSourceConfig["deploy_on_push"].([]interface{})
@@ -1264,6 +1730,8 @@ func flattenAppImageSourceSpec(i *godo.ImageSourceSpec) []interface{} {
 		r["registry"] = (*i).Registry
 		r["repository"] = (*i).Repository
 		r["tag"] = (*i).Tag
+		r["digest"] = (*i).Digest
+		r["registry_credentials"] = (*i).RegistryCredentials
 
 		if i.DeployOnPush != nil {
 			docrPush := make([]interface{}, 1)
@@ -1327,6 +1795,7 @@ func expandAppHealthCheck(config []interface{}) *godo.AppServiceSpecHealthCheck 
 		TimeoutSeconds:      int32(healthCheckConfig["timeout_seconds"].(int)),
 		SuccessThreshold:    int32(healthCheckConfig["success_threshold"].(int)),
 		FailureThreshold:    int32(healthCheckConfig["failure_threshold"].(int)),
+		Port:                int64(healthCheckConfig["port"].(int)),
 	}
 
 	return healthCheck
@@ -1344,6 +1813,7 @@ func flattenAppHealthCheck(check *godo.AppServiceSpecHealthCheck) []interface{} 
 		r["timeout_seconds"] = check.TimeoutSeconds
 		r["success_threshold"] = check.SuccessThreshold
 		r["failure_threshold"] = check.FailureThreshold
+		r["port"] = check.Port
 
 		result = append(result, r)
 	}
@@ -1431,6 +1901,11 @@ func expandAppSpecServices(config []interface{}) []*godo.AppServiceSpec {
 			s.GitLab = expandAppGitLabSourceSpec(gitlab)
 		}
 
+		bitbucket := service["bitbucket"].([]interface{})
+		if len(bitbucket) > 0 {
+			s.Bitbucket = expandAppBitBucketSourceSpec(bitbucket)
+		}
+
 		git := service["git"].([]interface{})
 		if len(git) > 0 {
 			s.Git = expandAppGitSourceSpec(git)
@@ -1471,6 +1946,16 @@ func expandAppSpecServices(config []interface{}) []*godo.AppServiceSpec {
 			s.LogDestinations = expandAppLogDestinations(logDestinations)
 		}
 
+		autoscaling := service["autoscaling"].([]interface{})
+		if len(autoscaling) > 0 {
+			s.Autoscaling = expandAppAutoscaling(autoscaling)
+		}
+
+		termination := service["termination"].([]interface{})
+		if len(termination) > 0 {
+			s.Termination = expandAppTermination[godo.AppServiceSpecTermination](termination)
+		}
+
 		appServices = append(appServices, s)
 	}
 
@@ -1488,6 +1973,7 @@ func flattenAppSpecServices(services []*godo.AppServiceSpec) []map[string]interf
 		r["build_command"] = s.BuildCommand
 		r["github"] = flattenAppGitHubSourceSpec(s.GitHub)
 		r["gitlab"] = flattenAppGitLabSourceSpec(s.GitLab)
+		r["bitbucket"] = flattenAppBitBucketSourceSpec(s.Bitbucket)
 		r["internal_ports"] = flattenAppServiceInternalPortsSpec(s.InternalPorts)
 		r["git"] = flattenAppGitSourceSpec(s.Git)
 		r["image"] = flattenAppImageSourceSpec(s.Image)
@@ -1503,6 +1989,8 @@ func flattenAppSpecServices(services []*godo.AppServiceSpec) []map[string]interf
 		r["cors"] = flattenAppCORSPolicy(s.CORS)
 		r["alert"] = flattenAppAlerts(s.Alerts)
 		r["log_destination"] = flattenAppLogDestinations(s.LogDestinations)
+		r["autoscaling"] = flattenAppAutoscaling(s.Autoscaling)
+		r["termination"] = flattenAppTermination(s.Termination)
 
 		result[i] = r
 	}
@@ -1539,6 +2027,11 @@ func expandAppSpecStaticSites(config []interface{}) []*godo.AppStaticSiteSpec {
 			s.GitLab = expandAppGitLabSourceSpec(gitlab)
 		}
 
+		bitbucket := site["bitbucket"].([]interface{})
+		if len(bitbucket) > 0 {
+			s.Bitbucket = expandAppBitBucketSourceSpec(bitbucket)
+		}
+
 		git := site["git"].([]interface{})
 		if len(git) > 0 {
 			s.Git = expandAppGitSourceSpec(git)
@@ -1570,6 +2063,7 @@ func flattenAppSpecStaticSites(sites []*godo.AppStaticSiteSpec) []map[string]int
 		r["build_command"] = s.BuildCommand
 		r["github"] = flattenAppGitHubSourceSpec(s.GitHub)
 		r["gitlab"] = flattenAppGitLabSourceSpec(s.GitLab)
+		r["bitbucket"] = flattenAppBitBucketSourceSpec(s.Bitbucket)
 		r["git"] = flattenAppGitSourceSpec(s.Git)
 		r["routes"] = flattenAppRoutes(s.Routes)
 		r["dockerfile_path"] = s.DockerfilePath
@@ -1586,6 +2080,18 @@ func flattenAppSpecStaticSites(sites []*godo.AppStaticSiteSpec) []map[string]int
 	}
 
 	return result
+}
+
+func expandAppSpecFeatures(featuresConfig *schema.Set) []string {
+	features := []string{}
+
+	for _, feature := range featuresConfig.List() {
+		if featureString, ok := feature.(string); ok {
+			features = append(features, featureString)
+		}
+	}
+
+	return features
 }
 
 func expandAppSpecWorkers(config []interface{}) []*godo.AppWorkerSpec {
@@ -1616,6 +2122,11 @@ func expandAppSpecWorkers(config []interface{}) []*godo.AppWorkerSpec {
 			s.GitLab = expandAppGitLabSourceSpec(gitlab)
 		}
 
+		bitbucket := worker["bitbucket"].([]interface{})
+		if len(bitbucket) > 0 {
+			s.Bitbucket = expandAppBitBucketSourceSpec(bitbucket)
+		}
+
 		git := worker["git"].([]interface{})
 		if len(git) > 0 {
 			s.Git = expandAppGitSourceSpec(git)
@@ -1636,6 +2147,16 @@ func expandAppSpecWorkers(config []interface{}) []*godo.AppWorkerSpec {
 			s.LogDestinations = expandAppLogDestinations(logDestinations)
 		}
 
+		autoscaling := worker["autoscaling"].([]interface{})
+		if len(autoscaling) > 0 {
+			s.Autoscaling = expandAppAutoscaling(autoscaling)
+		}
+
+		termination := worker["termination"].([]interface{})
+		if len(termination) > 0 {
+			s.Termination = expandAppTermination[godo.AppWorkerSpecTermination](termination)
+		}
+
 		appWorkers = append(appWorkers, s)
 	}
 
@@ -1653,6 +2174,7 @@ func flattenAppSpecWorkers(workers []*godo.AppWorkerSpec) []map[string]interface
 		r["build_command"] = w.BuildCommand
 		r["github"] = flattenAppGitHubSourceSpec(w.GitHub)
 		r["gitlab"] = flattenAppGitLabSourceSpec(w.GitLab)
+		r["bitbucket"] = flattenAppBitBucketSourceSpec(w.Bitbucket)
 		r["git"] = flattenAppGitSourceSpec(w.Git)
 		r["image"] = flattenAppImageSourceSpec(w.Image)
 		r["dockerfile_path"] = w.DockerfilePath
@@ -1663,6 +2185,8 @@ func flattenAppSpecWorkers(workers []*godo.AppWorkerSpec) []map[string]interface
 		r["environment_slug"] = w.EnvironmentSlug
 		r["alert"] = flattenAppAlerts(w.Alerts)
 		r["log_destination"] = flattenAppLogDestinations(w.LogDestinations)
+		r["autoscaling"] = flattenAppAutoscaling(w.Autoscaling)
+		r["termination"] = flattenAppTermination(w.Termination)
 
 		result[i] = r
 	}
@@ -1699,6 +2223,11 @@ func expandAppSpecJobs(config []interface{}) []*godo.AppJobSpec {
 			s.GitLab = expandAppGitLabSourceSpec(gitlab)
 		}
 
+		bitbucket := job["bitbucket"].([]interface{})
+		if len(bitbucket) > 0 {
+			s.Bitbucket = expandAppBitBucketSourceSpec(bitbucket)
+		}
+
 		git := job["git"].([]interface{})
 		if len(git) > 0 {
 			s.Git = expandAppGitSourceSpec(git)
@@ -1719,6 +2248,11 @@ func expandAppSpecJobs(config []interface{}) []*godo.AppJobSpec {
 			s.LogDestinations = expandAppLogDestinations(logDestinations)
 		}
 
+		termination := job["termination"].([]interface{})
+		if len(termination) > 0 {
+			s.Termination = expandAppTermination[godo.AppJobSpecTermination](termination)
+		}
+
 		appJobs = append(appJobs, s)
 	}
 
@@ -1736,6 +2270,7 @@ func flattenAppSpecJobs(jobs []*godo.AppJobSpec) []map[string]interface{} {
 		r["build_command"] = j.BuildCommand
 		r["github"] = flattenAppGitHubSourceSpec(j.GitHub)
 		r["gitlab"] = flattenAppGitLabSourceSpec(j.GitLab)
+		r["bitbucket"] = flattenAppBitBucketSourceSpec(j.Bitbucket)
 		r["git"] = flattenAppGitSourceSpec(j.Git)
 		r["image"] = flattenAppImageSourceSpec(j.Image)
 		r["dockerfile_path"] = j.DockerfilePath
@@ -1747,6 +2282,7 @@ func flattenAppSpecJobs(jobs []*godo.AppJobSpec) []map[string]interface{} {
 		r["kind"] = string(j.Kind)
 		r["alert"] = flattenAppAlerts(j.Alerts)
 		r["log_destination"] = flattenAppLogDestinations(j.LogDestinations)
+		r["termination"] = flattenAppTermination(j.Termination)
 
 		result[i] = r
 	}
@@ -1774,6 +2310,11 @@ func expandAppSpecFunctions(config []interface{}) []*godo.AppFunctionsSpec {
 		gitlab := fn["gitlab"].([]interface{})
 		if len(gitlab) > 0 {
 			f.GitLab = expandAppGitLabSourceSpec(gitlab)
+		}
+
+		bitbucket := fn["bitbucket"].([]interface{})
+		if len(bitbucket) > 0 {
+			f.Bitbucket = expandAppBitBucketSourceSpec(bitbucket)
 		}
 
 		git := fn["git"].([]interface{})
@@ -1817,6 +2358,7 @@ func flattenAppSpecFunctions(functions []*godo.AppFunctionsSpec) []map[string]in
 		r["source_dir"] = fn.SourceDir
 		r["github"] = flattenAppGitHubSourceSpec(fn.GitHub)
 		r["gitlab"] = flattenAppGitLabSourceSpec(fn.GitLab)
+		r["bitbucket"] = flattenAppBitBucketSourceSpec(fn.Bitbucket)
 		r["git"] = flattenAppGitSourceSpec(fn.Git)
 		r["routes"] = flattenAppRoutes(fn.Routes)
 		r["cors"] = flattenAppCORSPolicy(fn.CORS)
@@ -1874,22 +2416,25 @@ func flattenAppSpecDatabases(databases []*godo.AppDatabaseSpec) []map[string]int
 
 func expandAppCORSPolicy(config []interface{}) *godo.AppCORSPolicy {
 	if len(config) == 0 || config[0] == nil {
-		return &godo.AppCORSPolicy{}
+		return nil
 	}
 
 	appCORSConfig := config[0].(map[string]interface{})
 	allowOriginsConfig := appCORSConfig["allow_origins"].([]interface{})
-	allowOriginsMap := allowOriginsConfig[0].(map[string]interface{})
 
 	var allowOrigins []*godo.AppStringMatch
-	if allowOriginsMap["exact"] != "" {
-		allowOrigins = append(allowOrigins, &godo.AppStringMatch{Exact: allowOriginsMap["exact"].(string)})
-	}
-	if allowOriginsMap["prefix"] != "" {
-		allowOrigins = append(allowOrigins, &godo.AppStringMatch{Prefix: allowOriginsMap["prefix"].(string)})
-	}
-	if allowOriginsMap["regex"] != "" {
-		allowOrigins = append(allowOrigins, &godo.AppStringMatch{Regex: allowOriginsMap["regex"].(string)})
+	if len(allowOriginsConfig) > 0 {
+		allowOriginsMap := allowOriginsConfig[0].(map[string]interface{})
+
+		if allowOriginsMap["exact"] != "" {
+			allowOrigins = append(allowOrigins, &godo.AppStringMatch{Exact: allowOriginsMap["exact"].(string)})
+		}
+		if allowOriginsMap["prefix"] != "" {
+			allowOrigins = append(allowOrigins, &godo.AppStringMatch{Prefix: allowOriginsMap["prefix"].(string)})
+		}
+		if allowOriginsMap["regex"] != "" {
+			allowOrigins = append(allowOrigins, &godo.AppStringMatch{Regex: allowOriginsMap["regex"].(string)})
+		}
 	}
 
 	var allowMethods []string
@@ -1917,8 +2462,8 @@ func expandAppCORSPolicy(config []interface{}) *godo.AppCORSPolicy {
 	}
 }
 
-func flattenAppCORSPolicy(policy *godo.AppCORSPolicy) []interface{} {
-	result := make([]interface{}, 0)
+func flattenAppCORSPolicy(policy *godo.AppCORSPolicy) []map[string]interface{} {
+	result := make([]map[string]interface{}, 0)
 
 	if policy != nil {
 		r := make(map[string]interface{})
@@ -1940,11 +2485,243 @@ func flattenAppCORSPolicy(policy *godo.AppCORSPolicy) []interface{} {
 			r["allow_origins"] = append(allowOriginsResult, allowOrigins)
 		}
 
-		r["allow_methods"] = policy.AllowMethods
-		r["allow_headers"] = policy.AllowHeaders
-		r["expose_headers"] = policy.ExposeHeaders
+		if len(policy.AllowMethods) > 0 {
+			r["allow_methods"] = policy.AllowMethods
+		}
+		if len(policy.AllowHeaders) > 0 {
+			r["allow_headers"] = policy.AllowHeaders
+		}
+		if len(policy.ExposeHeaders) > 0 {
+			r["expose_headers"] = policy.ExposeHeaders
+		}
 		r["max_age"] = policy.MaxAge
 		r["allow_credentials"] = policy.AllowCredentials
+
+		result = append(result, r)
+	}
+
+	return result
+}
+
+func expandAppIngress(config []interface{}) *godo.AppIngressSpec {
+	if len(config) == 0 || config[0] == nil {
+		return nil
+	}
+
+	ingress := &godo.AppIngressSpec{}
+	ingressConfig := config[0].(map[string]interface{})
+	rules := ingressConfig["rule"].([]interface{})
+
+	for _, r := range rules {
+		rule := r.(map[string]interface{})
+		result := &godo.AppIngressSpecRule{
+			Match:     expandAppIngressMatch(rule["match"].([]interface{})),
+			Component: expandAppIngressComponent(rule["component"].([]interface{})),
+			Redirect:  expandAppIngressRedirect(rule["redirect"].([]interface{})),
+			CORS:      expandAppCORSPolicy(rule["cors"].([]interface{})),
+		}
+
+		ingress.Rules = append(ingress.Rules, result)
+	}
+
+	return ingress
+}
+
+func expandAppEgress(config []interface{}) *godo.AppEgressSpec {
+	if len(config) == 0 || config[0] == nil {
+		return nil
+	}
+	egressConfig := config[0].(map[string]interface{})
+
+	return &godo.AppEgressSpec{
+		Type: godo.AppEgressSpecType(egressConfig["type"].(string)),
+	}
+}
+
+func expandAppIngressComponent(config []interface{}) *godo.AppIngressSpecRuleRoutingComponent {
+	if len(config) == 0 || config[0] == nil {
+		return nil
+	}
+
+	component := config[0].(map[string]interface{})
+
+	return &godo.AppIngressSpecRuleRoutingComponent{
+		Name:               component["name"].(string),
+		PreservePathPrefix: component["preserve_path_prefix"].(bool),
+		Rewrite:            component["rewrite"].(string),
+	}
+}
+
+func expandAppIngressRedirect(config []interface{}) *godo.AppIngressSpecRuleRoutingRedirect {
+	if len(config) == 0 || config[0] == nil {
+		return nil
+	}
+
+	redirect := config[0].(map[string]interface{})
+
+	return &godo.AppIngressSpecRuleRoutingRedirect{
+		Uri:          redirect["uri"].(string),
+		Authority:    redirect["authority"].(string),
+		Port:         int64(redirect["port"].(int)),
+		Scheme:       redirect["scheme"].(string),
+		RedirectCode: int64(redirect["redirect_code"].(int)),
+	}
+}
+
+func expandAppIngressMatch(config []interface{}) *godo.AppIngressSpecRuleMatch {
+	if len(config) == 0 || config[0] == nil {
+		return nil
+	}
+
+	match := config[0].(map[string]interface{})
+	path := match["path"].([]interface{})[0].(map[string]interface{})
+
+	return &godo.AppIngressSpecRuleMatch{
+		Path: &godo.AppIngressSpecRuleStringMatch{
+			Prefix: path["prefix"].(string),
+		},
+	}
+}
+
+func expandAppTermination[T AppSpecTermination](config []interface{}) *T {
+	if len(config) == 0 || config[0] == nil {
+		return nil
+	}
+
+	terminationConfig := config[0].(map[string]interface{})
+
+	termination := new(T)
+	switch t := any(termination).(type) {
+	case *godo.AppServiceSpecTermination:
+		t.GracePeriodSeconds = int32(terminationConfig["grace_period_seconds"].(int))
+		t.DrainSeconds = int32(terminationConfig["drain_seconds"].(int))
+	case *godo.AppWorkerSpecTermination:
+		t.GracePeriodSeconds = int32(terminationConfig["grace_period_seconds"].(int))
+	case *godo.AppJobSpecTermination:
+		t.GracePeriodSeconds = int32(terminationConfig["grace_period_seconds"].(int))
+	}
+
+	return termination
+}
+
+func flattenAppTermination[T AppSpecTermination](termination *T) []interface{} {
+	result := make([]interface{}, 0)
+
+	if termination != nil {
+		r := make(map[string]interface{})
+
+		switch t := any(termination).(type) {
+		case *godo.AppServiceSpecTermination:
+			r["grace_period_seconds"] = t.GracePeriodSeconds
+			r["drain_seconds"] = t.DrainSeconds
+		case *godo.AppWorkerSpecTermination:
+			r["grace_period_seconds"] = t.GracePeriodSeconds
+		case *godo.AppJobSpecTermination:
+			r["grace_period_seconds"] = t.GracePeriodSeconds
+		}
+
+		result = append(result, r)
+	}
+
+	return result
+}
+
+func flattenAppEgress(egress *godo.AppEgressSpec) []map[string]interface{} {
+	if egress != nil {
+		result := make([]map[string]interface{}, 0)
+		item := make(map[string]interface{})
+
+		item["type"] = egress.Type
+		result = append(result, item)
+
+		return result
+	}
+
+	return nil
+}
+
+func flattenAppIngress(ingress *godo.AppIngressSpec) []map[string]interface{} {
+	if ingress != nil {
+		rules := make([]map[string]interface{}, 0)
+
+		for _, r := range ingress.Rules {
+			rules = append(rules, flattenAppIngressRule(r))
+		}
+
+		return []map[string]interface{}{
+			{
+				"rule": rules,
+			},
+		}
+	}
+
+	return nil
+}
+
+func flattenAppIngressRule(rule *godo.AppIngressSpecRule) map[string]interface{} {
+	result := make(map[string]interface{}, 0)
+
+	if rule != nil {
+		r := make(map[string]interface{})
+
+		r["component"] = flattenAppIngressRuleComponent(rule.Component)
+		r["match"] = flattenAppIngressRuleMatch(rule.Match)
+		r["cors"] = flattenAppCORSPolicy(rule.CORS)
+		r["redirect"] = flattenAppIngressRuleRedirect(rule.Redirect)
+
+		result = r
+	}
+
+	return result
+}
+
+func flattenAppIngressRuleComponent(component *godo.AppIngressSpecRuleRoutingComponent) []map[string]interface{} {
+	result := make([]map[string]interface{}, 0)
+
+	if component != nil {
+		r := make(map[string]interface{})
+
+		r["name"] = component.Name
+		r["preserve_path_prefix"] = component.PreservePathPrefix
+		r["rewrite"] = component.Rewrite
+
+		result = append(result, r)
+	}
+
+	return result
+}
+
+func flattenAppIngressRuleMatch(match *godo.AppIngressSpecRuleMatch) []map[string]interface{} {
+	result := make([]map[string]interface{}, 0)
+
+	if match != nil {
+		r := make(map[string]interface{})
+
+		pathResult := make([]map[string]interface{}, 0)
+		path := make(map[string]interface{})
+		if match.Path != nil {
+			path["prefix"] = match.Path.Prefix
+		}
+		pathResult = append(pathResult, path)
+		r["path"] = pathResult
+
+		result = append(result, r)
+	}
+
+	return result
+}
+
+func flattenAppIngressRuleRedirect(redirect *godo.AppIngressSpecRuleRoutingRedirect) []map[string]interface{} {
+	result := make([]map[string]interface{}, 0)
+
+	if redirect != nil {
+		r := make(map[string]interface{})
+
+		r["uri"] = redirect.Uri
+		r["authority"] = redirect.Authority
+		r["port"] = redirect.Port
+		r["scheme"] = redirect.Scheme
+		r["redirect_code"] = redirect.RedirectCode
 
 		result = append(result, r)
 	}

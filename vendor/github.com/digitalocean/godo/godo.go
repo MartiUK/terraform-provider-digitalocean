@@ -21,7 +21,7 @@ import (
 )
 
 const (
-	libraryVersion = "1.102.1"
+	libraryVersion = "1.135.0"
 	defaultBaseURL = "https://api.digitalocean.com/"
 	userAgent      = "godo/" + libraryVersion
 	mediaType      = "application/json"
@@ -31,6 +31,10 @@ const (
 	headerRateReset             = "RateLimit-Reset"
 	headerRequestID             = "x-request-id"
 	internalHeaderRetryAttempts = "X-Godo-Retry-Attempts"
+
+	defaultRetryMax     = 4
+	defaultRetryWaitMax = 30
+	defaultRetryWaitMin = 1
 )
 
 // Client manages communication with DigitalOcean V2 API.
@@ -50,41 +54,47 @@ type Client struct {
 	ratemtx sync.Mutex
 
 	// Services used for communicating with the API
-	Account           AccountService
-	Actions           ActionsService
-	Apps              AppsService
-	Balance           BalanceService
-	BillingHistory    BillingHistoryService
-	CDNs              CDNService
-	Certificates      CertificatesService
-	Databases         DatabasesService
-	Domains           DomainsService
-	Droplets          DropletsService
-	DropletActions    DropletActionsService
-	Firewalls         FirewallsService
-	FloatingIPs       FloatingIPsService
-	FloatingIPActions FloatingIPActionsService
-	Functions         FunctionsService
-	Images            ImagesService
-	ImageActions      ImageActionsService
-	Invoices          InvoicesService
-	Keys              KeysService
-	Kubernetes        KubernetesService
-	LoadBalancers     LoadBalancersService
-	Monitoring        MonitoringService
-	OneClick          OneClickService
-	Projects          ProjectsService
-	Regions           RegionsService
-	Registry          RegistryService
-	ReservedIPs       ReservedIPsService
-	ReservedIPActions ReservedIPActionsService
-	Sizes             SizesService
-	Snapshots         SnapshotsService
-	Storage           StorageService
-	StorageActions    StorageActionsService
-	Tags              TagsService
-	UptimeChecks      UptimeChecksService
-	VPCs              VPCsService
+	Account                        AccountService
+	Actions                        ActionsService
+	Apps                           AppsService
+	Balance                        BalanceService
+	BillingHistory                 BillingHistoryService
+	CDNs                           CDNService
+	Certificates                   CertificatesService
+	Databases                      DatabasesService
+	Domains                        DomainsService
+	Droplets                       DropletsService
+	DropletActions                 DropletActionsService
+	DropletAutoscale               DropletAutoscaleService
+	Firewalls                      FirewallsService
+	FloatingIPs                    FloatingIPsService
+	FloatingIPActions              FloatingIPActionsService
+	Functions                      FunctionsService
+	Images                         ImagesService
+	ImageActions                   ImageActionsService
+	Invoices                       InvoicesService
+	Keys                           KeysService
+	Kubernetes                     KubernetesService
+	LoadBalancers                  LoadBalancersService
+	Monitoring                     MonitoringService
+	OneClick                       OneClickService
+	Projects                       ProjectsService
+	Regions                        RegionsService
+	Registry                       RegistryService
+	Registries                     RegistriesService
+	ReservedIPs                    ReservedIPsService
+	ReservedIPV6s                  ReservedIPV6sService
+	ReservedIPActions              ReservedIPActionsService
+	ReservedIPV6Actions            ReservedIPV6ActionsService
+	Sizes                          SizesService
+	Snapshots                      SnapshotsService
+	SpacesKeys                     SpacesKeysService
+	Storage                        StorageService
+	StorageActions                 StorageActionsService
+	Tags                           TagsService
+	UptimeChecks                   UptimeChecksService
+	VPCs                           VPCsService
+	PartnerInterconnectAttachments PartnerInterconnectAttachmentsService
 
 	// Optional function called after every successful request made to the DO APIs
 	onRequestCompleted RequestCompletionCallback
@@ -229,7 +239,20 @@ func NewFromToken(token string) *Client {
 	cleanToken := strings.Trim(strings.TrimSpace(token), "'")
 	ctx := context.Background()
 	ts := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: cleanToken})
-	return NewClient(oauth2.NewClient(ctx, ts))
+
+	oauthClient := oauth2.NewClient(ctx, ts)
+	client, err := New(oauthClient, WithRetryAndBackoffs(
+		RetryConfig{
+			RetryMax:     defaultRetryMax,
+			RetryWaitMin: PtrTo(float64(defaultRetryWaitMin)),
+			RetryWaitMax: PtrTo(float64(defaultRetryWaitMax)),
+		},
+	))
+	if err != nil {
+		panic(err)
+	}
+
+	return client
 }
 
 // NewClient returns a new DigitalOcean API client, using the given
@@ -258,6 +281,7 @@ func NewClient(httpClient *http.Client) *Client {
 	c.Domains = &DomainsServiceOp{client: c}
 	c.Droplets = &DropletsServiceOp{client: c}
 	c.DropletActions = &DropletActionsServiceOp{client: c}
+	c.DropletAutoscale = &DropletAutoscaleServiceOp{client: c}
 	c.Firewalls = &FirewallsServiceOp{client: c}
 	c.FloatingIPs = &FloatingIPsServiceOp{client: c}
 	c.FloatingIPActions = &FloatingIPActionsServiceOp{client: c}
@@ -273,15 +297,20 @@ func NewClient(httpClient *http.Client) *Client {
 	c.Projects = &ProjectsServiceOp{client: c}
 	c.Regions = &RegionsServiceOp{client: c}
 	c.Registry = &RegistryServiceOp{client: c}
+	c.Registries = &RegistriesServiceOp{client: c}
 	c.ReservedIPs = &ReservedIPsServiceOp{client: c}
+	c.ReservedIPV6s = &ReservedIPV6sServiceOp{client: c}
 	c.ReservedIPActions = &ReservedIPActionsServiceOp{client: c}
+	c.ReservedIPV6Actions = &ReservedIPV6ActionsServiceOp{client: c}
 	c.Sizes = &SizesServiceOp{client: c}
 	c.Snapshots = &SnapshotsServiceOp{client: c}
+	c.SpacesKeys = &SpacesKeysServiceOp{client: c}
 	c.Storage = &StorageServiceOp{client: c}
 	c.StorageActions = &StorageActionsServiceOp{client: c}
 	c.Tags = &TagsServiceOp{client: c}
 	c.UptimeChecks = &UptimeChecksServiceOp{client: c}
 	c.VPCs = &VPCsServiceOp{client: c}
+	c.PartnerInterconnectAttachments = &PartnerInterconnectAttachmentsServiceOp{client: c}
 
 	c.headers = make(map[string]string)
 
@@ -329,6 +358,16 @@ func New(httpClient *http.Client, opts ...ClientOpt) (*Client, error) {
 			}
 
 			return resp, err
+		}
+
+		retryableClient.CheckRetry = func(ctx context.Context, resp *http.Response, err error) (bool, error) {
+			// In addition to the default retry policy, we also retry HTTP/2 INTERNAL_ERROR errors.
+			// See: https://github.com/golang/go/issues/51323
+			if err != nil && strings.Contains(err.Error(), "INTERNAL_ERROR") && strings.Contains(reflect.TypeOf(err).String(), "http2") {
+				return true, nil
+			}
+
+			return retryablehttp.DefaultRetryPolicy(ctx, resp, err)
 		}
 
 		var source *oauth2.Transport

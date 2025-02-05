@@ -10,6 +10,7 @@ import (
 	"github.com/digitalocean/terraform-provider-digitalocean/digitalocean/config"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/validation"
 )
 
 func ResourceDigitalOceanApp() *schema.Resource {
@@ -33,6 +34,14 @@ func ResourceDigitalOceanApp() *schema.Resource {
 				},
 			},
 
+			"project_id": {
+				Type:         schema.TypeString,
+				Optional:     true,
+				ForceNew:     true,
+				Computed:     true,
+				ValidateFunc: validation.NoZeroValues,
+			},
+
 			// Computed attributes
 			"default_ingress": {
 				Type:        schema.TypeString,
@@ -40,7 +49,41 @@ func ResourceDigitalOceanApp() *schema.Resource {
 				Description: "The default URL to access the App",
 			},
 
+			"dedicated_ips": {
+				Type:        schema.TypeList,
+				Optional:    true,
+				Computed:    true,
+				Description: "The dedicated egress IP addresses associated with the app.",
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"ip": {
+							Type:        schema.TypeString,
+							Computed:    true,
+							Optional:    true,
+							Description: "The IP address of the dedicated egress IP.",
+						},
+						"id": {
+							Type:        schema.TypeString,
+							Computed:    true,
+							Optional:    true,
+							Description: "The ID of the dedicated egress IP.",
+						},
+						"status": {
+							Type:        schema.TypeString,
+							Computed:    true,
+							Optional:    true,
+							Description: "The status of the dedicated egress IP: 'UNKNOWN', 'ASSIGNING', 'ASSIGNED', or 'REMOVED'",
+						},
+					},
+				},
+			},
+
 			"live_url": {
+				Type:     schema.TypeString,
+				Computed: true,
+			},
+
+			"live_domain": {
 				Type:     schema.TypeString,
 				Computed: true,
 			},
@@ -84,6 +127,10 @@ func resourceDigitalOceanAppCreate(ctx context.Context, d *schema.ResourceData, 
 	appCreateRequest := &godo.AppCreateRequest{}
 	appCreateRequest.Spec = expandAppSpec(d.Get("spec").([]interface{}))
 
+	if v, ok := d.GetOk("project_id"); ok {
+		appCreateRequest.ProjectID = v.(string)
+	}
+
 	log.Printf("[DEBUG] App create request: %#v", appCreateRequest)
 	app, _, err := client.Apps.Create(context.Background(), appCreateRequest)
 	if err != nil {
@@ -119,9 +166,15 @@ func resourceDigitalOceanAppRead(ctx context.Context, d *schema.ResourceData, me
 	d.SetId(app.ID)
 	d.Set("default_ingress", app.DefaultIngress)
 	d.Set("live_url", app.LiveURL)
+	d.Set("live_domain", app.LiveDomain)
 	d.Set("updated_at", app.UpdatedAt.UTC().String())
 	d.Set("created_at", app.CreatedAt.UTC().String())
 	d.Set("urn", app.URN())
+	d.Set("project_id", app.ProjectID)
+
+	if app.DedicatedIps != nil {
+		d.Set("dedicated_ips", appDedicatedIps(d, app))
+	}
 
 	if err := d.Set("spec", flattenAppSpec(d, app.Spec)); err != nil {
 		return diag.Errorf("Error setting app spec: %#v", err)
@@ -139,6 +192,19 @@ func resourceDigitalOceanAppRead(ctx context.Context, d *schema.ResourceData, me
 	}
 
 	return nil
+}
+
+func appDedicatedIps(d *schema.ResourceData, app *godo.App) []interface{} {
+	remote := make([]interface{}, 0, len(app.DedicatedIps))
+	for _, change := range app.DedicatedIps {
+		rawChange := map[string]interface{}{
+			"ip":     change.Ip,
+			"id":     change.ID,
+			"status": change.Status,
+		}
+		remote = append(remote, rawChange)
+	}
+	return remote
 }
 
 func resourceDigitalOceanAppUpdate(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
@@ -221,7 +287,14 @@ func waitForAppDeployment(client *godo.Client, id string, timeout time.Duration)
 				return fmt.Errorf("Error trying to read app deployment state: %s", err)
 			}
 
-			allSuccessful := deployment.Progress.SuccessSteps == deployment.Progress.TotalSteps
+			allSuccessful := true
+			for _, step := range deployment.Progress.Steps {
+				if step.Status != godo.DeploymentProgressStepStatus_Success {
+					allSuccessful = false
+					break
+				}
+			}
+
 			if allSuccessful {
 				ticker.Stop()
 				return nil

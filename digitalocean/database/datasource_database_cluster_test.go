@@ -8,14 +8,13 @@ import (
 	"github.com/digitalocean/godo"
 	"github.com/digitalocean/terraform-provider-digitalocean/digitalocean/acceptance"
 	"github.com/digitalocean/terraform-provider-digitalocean/digitalocean/config"
-	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/acctest"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/terraform"
 )
 
 func TestAccDataSourceDigitalOceanDatabaseCluster_Basic(t *testing.T) {
 	var database godo.Database
-	databaseName := fmt.Sprintf("foobar-test-terraform-%s", acctest.RandString(10))
+	databaseName := acceptance.RandomTestName()
 
 	resource.ParallelTest(t, resource.TestCase{
 		PreCheck:          func() { acceptance.TestAccPreCheck(t) },
@@ -46,6 +45,8 @@ func TestAccDataSourceDigitalOceanDatabaseCluster_Basic(t *testing.T) {
 						"data.digitalocean_database_cluster.foobar", "private_network_uuid"),
 					resource.TestCheckResourceAttrSet(
 						"data.digitalocean_database_cluster.foobar", "project_id"),
+					resource.TestCheckResourceAttrSet(
+						"data.digitalocean_database_cluster.foobar", "storage_size_mib"),
 					testAccCheckDigitalOceanDatabaseClusterURIPassword(
 						"digitalocean_database_cluster.foobar", "uri"),
 					testAccCheckDigitalOceanDatabaseClusterURIPassword(
@@ -87,25 +88,27 @@ func testAccCheckDataSourceDigitalOceanDatabaseClusterExists(n string, databaseC
 
 const testAccCheckDataSourceDigitalOceanDatabaseClusterConfigBasic = `
 resource "digitalocean_database_cluster" "foobar" {
-  name       = "%s"
-  engine     = "pg"
-  version    = "15"
-  size       = "db-s-1vcpu-1gb"
-  region     = "nyc1"
-  node_count = 1
-  tags       = ["production"]
+  name             = "%s"
+  engine           = "pg"
+  version          = "15"
+  size             = "db-s-1vcpu-1gb"
+  region           = "nyc1"
+  node_count       = 1
+  tags             = ["production"]
+  storage_size_mib = 10240
 }
 `
 
 const testAccCheckDataSourceDigitalOceanDatabaseClusterConfigWithDatasource = `
 resource "digitalocean_database_cluster" "foobar" {
-  name       = "%s"
-  engine     = "pg"
-  version    = "15"
-  size       = "db-s-1vcpu-1gb"
-  region     = "nyc1"
-  node_count = 1
-  tags       = ["production"]
+  name             = "%s"
+  engine           = "pg"
+  version          = "15"
+  size             = "db-s-1vcpu-1gb"
+  region           = "nyc1"
+  node_count       = 1
+  tags             = ["production"]
+  storage_size_mib = 10240
 }
 
 data "digitalocean_database_cluster" "foobar" {

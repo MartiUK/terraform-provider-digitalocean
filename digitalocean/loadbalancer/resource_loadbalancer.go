@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/http"
 	"strings"
 	"time"
 
@@ -12,7 +13,7 @@ import (
 	"github.com/digitalocean/terraform-provider-digitalocean/digitalocean/tag"
 	"github.com/digitalocean/terraform-provider-digitalocean/digitalocean/util"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
-	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/retry"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/validation"
 )
@@ -81,6 +82,10 @@ func ResourceDigitalOceanLoadbalancer() *schema.Resource {
 				}
 			}
 
+			if err := loadbalancerDiffCheck(ctx, diff, v); err != nil {
+				return err
+			}
+
 			return nil
 		},
 	}
@@ -113,12 +118,35 @@ func resourceDigitalOceanLoadBalancerV1() map[string]*schema.Schema {
 	return loadBalancerV1Schema
 }
 
+func loadbalancerDiffCheck(ctx context.Context, d *schema.ResourceDiff, v interface{}) error {
+	typ, typSet := d.GetOk("type")
+	region, regionSet := d.GetOk("region")
+
+	if !typSet && !regionSet {
+		return fmt.Errorf("missing 'region' value")
+	}
+
+	typStr := typ.(string)
+	switch strings.ToUpper(typStr) {
+	case "GLOBAL":
+		if regionSet && region.(string) != "" {
+			return fmt.Errorf("'region' must be empty or not set when 'type' is '%s'", typStr)
+		}
+	case "REGIONAL", "REGIONAL_NETWORK":
+		if !regionSet || region.(string) == "" {
+			return fmt.Errorf("'region' must be set and not be empty when 'type' is '%s'", typStr)
+		}
+	}
+
+	return nil
+}
+
 func resourceDigitalOceanLoadBalancerV0() *schema.Resource {
 	return &schema.Resource{
 		Schema: map[string]*schema.Schema{
 			"region": {
 				Type:     schema.TypeString,
-				Required: true,
+				Optional: true,
 				ForceNew: true,
 				StateFunc: func(val interface{}) string {
 					// DO API V2 region slug is always lowercase
@@ -152,7 +180,7 @@ func resourceDigitalOceanLoadBalancerV0() *schema.Resource {
 				Type:         schema.TypeInt,
 				Optional:     true,
 				Computed:     true,
-				ValidateFunc: validation.IntBetween(1, 100),
+				ValidateFunc: validation.IntBetween(1, 200),
 			},
 			"name": {
 				Type:         schema.TypeString,
@@ -172,12 +200,14 @@ func resourceDigitalOceanLoadBalancerV0() *schema.Resource {
 					"round_robin",
 					"least_connections",
 				}, false),
+				Deprecated: "This field has been deprecated. You can no longer specify an algorithm for load balancers.",
 			},
 
 			"forwarding_rule": {
-				Type:     schema.TypeSet,
-				Required: true,
-				MinItems: 1,
+				Type:          schema.TypeSet,
+				Optional:      true,
+				ConflictsWith: []string{"glb_settings"},
+				MinItems:      1,
 				Elem: &schema.Resource{
 					Schema: map[string]*schema.Schema{
 						"entry_protocol": {
@@ -364,6 +394,11 @@ func resourceDigitalOceanLoadBalancerV0() *schema.Resource {
 				Computed: true,
 			},
 
+			"ipv6": {
+				Type:     schema.TypeString,
+				Computed: true,
+			},
+
 			"status": {
 				Type:     schema.TypeString,
 				Computed: true,
@@ -403,11 +438,139 @@ func resourceDigitalOceanLoadBalancerV0() *schema.Resource {
 					},
 				},
 			},
+
 			"type": {
-				Type:        schema.TypeString,
+				Type:         schema.TypeString,
+				Optional:     true,
+				ForceNew:     true,
+				ValidateFunc: validation.StringInSlice([]string{"REGIONAL", "GLOBAL", "REGIONAL_NETWORK"}, true),
+				Description:  "the type of the load balancer (GLOBAL, REGIONAL, or REGIONAL_NETWORK)",
+			},
+
+			"domains": {
+				Type:        schema.TypeSet,
 				Optional:    true,
-				ForceNew:    true,
-				Description: "the type of the load balancer (GLOBAL or REGIONAL)",
+				Computed:    true,
+				MinItems:    1,
+				Description: "the list of domains required to ingress traffic to global load balancer",
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"name": {
+							Type:         schema.TypeString,
+							Required:     true,
+							ValidateFunc: validation.NoZeroValues,
+							Description:  "domain name",
+						},
+						"is_managed": {
+							Type:        schema.TypeBool,
+							Optional:    true,
+							Default:     false,
+							Description: "flag indicating if domain is managed by DigitalOcean",
+						},
+						"certificate_name": {
+							Type:         schema.TypeString,
+							Optional:     true,
+							Computed:     true,
+							ValidateFunc: validation.NoZeroValues,
+							Description:  "name of certificate required for TLS handshaking",
+						},
+						"verification_error_reasons": {
+							Type:        schema.TypeList,
+							Computed:    true,
+							Elem:        &schema.Schema{Type: schema.TypeString},
+							Description: "list of domain verification errors",
+						},
+						"ssl_validation_error_reasons": {
+							Type:        schema.TypeList,
+							Computed:    true,
+							Elem:        &schema.Schema{Type: schema.TypeString},
+							Description: "list of domain SSL validation errors",
+						},
+					},
+				},
+			},
+
+			"glb_settings": {
+				Type:          schema.TypeList,
+				Optional:      true,
+				Computed:      true,
+				MaxItems:      1,
+				ConflictsWith: []string{"forwarding_rule"},
+				Description:   "configuration options for global load balancer",
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"target_protocol": {
+							Type:     schema.TypeString,
+							Required: true,
+							ValidateFunc: validation.StringInSlice([]string{
+								"http",
+								"https",
+							}, false),
+							Description: "target protocol rules",
+						},
+						"target_port": {
+							Type:         schema.TypeInt,
+							Required:     true,
+							ValidateFunc: validation.IntInSlice([]int{80, 443}),
+							Description:  "target port rules",
+						},
+						"region_priorities": {
+							Type:        schema.TypeMap,
+							Optional:    true,
+							Description: "region priority map",
+							Elem: &schema.Schema{
+								Type: schema.TypeInt,
+							},
+						},
+						"failover_threshold": {
+							Type:         schema.TypeInt,
+							Optional:     true,
+							ValidateFunc: validation.IntBetween(1, 99),
+							Description:  "fail-over threshold",
+						},
+						"cdn": {
+							Type:        schema.TypeList,
+							Optional:    true,
+							MaxItems:    1,
+							Description: "CDN specific configurations",
+							Elem: &schema.Resource{
+								Schema: map[string]*schema.Schema{
+									"is_enabled": {
+										Type:        schema.TypeBool,
+										Optional:    true,
+										Default:     false,
+										Description: "cache enable flag",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+
+			"target_load_balancer_ids": {
+				Type:        schema.TypeSet,
+				Elem:        &schema.Schema{Type: schema.TypeString},
+				Optional:    true,
+				Computed:    true,
+				Description: "list of load balancer IDs to put behind a global load balancer",
+			},
+
+			"network": {
+				Type:         schema.TypeString,
+				Optional:     true,
+				ForceNew:     true,
+				ValidateFunc: validation.StringInSlice([]string{"EXTERNAL", "INTERNAL"}, true),
+				Description:  "the type of network the load balancer is accessible from (EXTERNAL or INTERNAL)",
+			},
+
+			"network_stack": {
+				Type:         schema.TypeString,
+				Optional:     true,
+				ForceNew:     true,
+				ValidateFunc: validation.StringInSlice([]string{"IPV4", "DUALSTACK"}, true),
+				Description: "The network stack determines the allocation of ipv4/ipv6 addresses to the load balancer. Enum: 'IPV4' 'DUALSTACK'," +
+					" (NOTE: this feature is in private preview, contact DigitalOcean support to review its public availability.)",
 			},
 		},
 	}
@@ -456,7 +619,7 @@ func buildLoadBalancerRequest(client *godo.Client, d *schema.ResourceData) (*god
 		EnableProxyProtocol:          d.Get("enable_proxy_protocol").(bool),
 		EnableBackendKeepalive:       d.Get("enable_backend_keepalive").(bool),
 		ForwardingRules:              forwardingRules,
-		DisableLetsEncryptDNSRecords: godo.Bool(d.Get("disable_lets_encrypt_dns_records").(bool)),
+		DisableLetsEncryptDNSRecords: godo.PtrTo(d.Get("disable_lets_encrypt_dns_records").(bool)),
 		ProjectID:                    d.Get("project_id").(string),
 	}
 	sizeUnit, ok := d.GetOk("size_unit")
@@ -503,6 +666,36 @@ func buildLoadBalancerRequest(client *godo.Client, d *schema.ResourceData) (*god
 		opts.Type = v.(string)
 	}
 
+	if v, ok := d.GetOk("domains"); ok {
+		domains, err := expandDomains(client, v.(*schema.Set).List())
+		if err != nil {
+			return nil, err
+		}
+
+		opts.Domains = domains
+	}
+
+	if v, ok := d.GetOk("glb_settings"); ok {
+		opts.GLBSettings = expandGLBSettings(v.([]interface{}))
+	}
+
+	if v, ok := d.GetOk("target_load_balancer_ids"); ok {
+		var lbIDs []string
+		for _, id := range v.(*schema.Set).List() {
+			lbIDs = append(lbIDs, id.(string))
+		}
+
+		opts.TargetLoadBalancerIDs = lbIDs
+	}
+
+	if v, ok := d.GetOk("network"); ok {
+		opts.Network = v.(string)
+	}
+
+	if v, ok := d.GetOk("network_stack"); ok {
+		opts.NetworkStack = v.(string)
+	}
+
 	return opts, nil
 }
 
@@ -525,7 +718,7 @@ func resourceDigitalOceanLoadbalancerCreate(ctx context.Context, d *schema.Resou
 	d.SetId(loadbalancer.ID)
 
 	log.Printf("[DEBUG] Waiting for Load Balancer (%s) to become active", d.Get("name"))
-	stateConf := &resource.StateChangeConf{
+	stateConf := &retry.StateChangeConf{
 		Pending:    []string{"new"},
 		Target:     []string{"active"},
 		Refresh:    loadbalancerStateRefreshFunc(client, d.Id()),
@@ -558,7 +751,6 @@ func resourceDigitalOceanLoadbalancerRead(ctx context.Context, d *schema.Resourc
 	d.Set("ip", loadbalancer.IP)
 	d.Set("status", loadbalancer.Status)
 	d.Set("algorithm", loadbalancer.Algorithm)
-	d.Set("region", loadbalancer.Region.Slug)
 	d.Set("redirect_http_to_https", loadbalancer.RedirectHttpToHttps)
 	d.Set("enable_proxy_protocol", loadbalancer.EnableProxyProtocol)
 	d.Set("enable_backend_keepalive", loadbalancer.EnableBackendKeepalive)
@@ -567,10 +759,18 @@ func resourceDigitalOceanLoadbalancerRead(ctx context.Context, d *schema.Resourc
 	d.Set("http_idle_timeout_seconds", loadbalancer.HTTPIdleTimeoutSeconds)
 	d.Set("project_id", loadbalancer.ProjectID)
 
+	if loadbalancer.IPv6 != "" {
+		d.Set("ipv6", loadbalancer.IPv6)
+	}
+
 	if loadbalancer.SizeUnit > 0 {
 		d.Set("size_unit", loadbalancer.SizeUnit)
 	} else {
 		d.Set("size", loadbalancer.SizeSlug)
+	}
+
+	if loadbalancer.Region != nil {
+		d.Set("region", loadbalancer.Region.Slug)
 	}
 
 	d.Set("disable_lets_encrypt_dns_records", loadbalancer.DisableLetsEncryptDNSRecords)
@@ -624,8 +824,13 @@ func resourceDigitalOceanLoadbalancerDelete(ctx context.Context, d *schema.Resou
 	client := meta.(*config.CombinedConfig).GodoClient()
 
 	log.Printf("[INFO] Deleting Load Balancer: %s", d.Id())
-	_, err := client.LoadBalancers.Delete(context.Background(), d.Id())
+	resp, err := client.LoadBalancers.Delete(context.Background(), d.Id())
 	if err != nil {
+		if resp != nil && resp.StatusCode == http.StatusNotFound {
+			d.SetId("")
+			return nil
+		}
+
 		return diag.Errorf("Error deleting Load Balancer: %s", err)
 	}
 
